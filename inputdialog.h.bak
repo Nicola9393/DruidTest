@@ -1,0 +1,45 @@
+/***************************************************************************
+**                                                                        **
+** Copyright (C)  2015 by Piovan S.p.a                                    **
+**                                                                        **
+**	Author: Enricomaria Pavan                                         **
+**                                                                        **
+**                                                                        **
+****************************************************************************/
+
+#ifndef INPUTDIALOG_H
+#define INPUTDIALOG_H
+
+#include <QDialog>
+
+namespace Ui {
+	class InputDialog;
+}
+
+class PvnnModbusDriverItem;
+
+class InputDialog : public QDialog
+{
+	Q_OBJECT
+
+public:
+	InputDialog(QWidget *parent, PvnnModbusDriverItem *item);
+	~InputDialog();
+
+	QString tentativeValue();
+
+protected:
+	void accept();
+	void reject();
+
+private slots:
+	void doubleValueChanged(double value);
+
+private:
+	Ui::InputDialog *m_ui;
+
+	PvnnModbusDriverItem * m_item;
+	QString m_tentativeValue;
+};
+
+#endif // INPUTDIALOG_H

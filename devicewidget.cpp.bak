@@ -1,0 +1,931 @@
+/***************************************************************************
+**                                                                        **
+** Copyright (C)  2015 by Piovan S.p.a                                    **
+**                                                                        **
+**	Author: Enricomaria Pavan                                         **
+**                                                                        **
+**                                                                        **
+****************************************************************************/
+
+#include <QShortcut>
+#include <QMessageBox>
+#include <QFileDialog>
+#include <QMenu>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QInputDialog>
+#include <QSettings>
+#include <QDate>
+#include <QDateTime>
+#include <QThread>
+
+#include "devicewidget.h"
+#include "ui_devicewidget.h"
+#include "tracewidget.h"
+#include "logger.h"
+#include "inputdialog.h"
+#include "pvnlab.h"
+#include "pvnlab_modbus_driver_device.h"
+#include "pvnlab_modbus_driver_item.h"
+#include "tableupdater.h"
+
+
+DeviceWidget::DeviceWidget(QWidget *parent, PvnnModbusDriverDevice *device, QString cfg): QWidget(parent), m_ui(new Ui::DeviceWidget){
+	m_device = device;
+	m_cfg = cfg;
+
+	m_logging = false;
+	m_tableRegisterUpdateThread = NULL;
+	m_tableInputUpdateThread = NULL;
+	m_tableOutputUpdateThread = NULL;
+	m_tableDebugUpdateThread = NULL;
+	m_tablePersonalizedUpdateThread = NULL;
+
+	m_ui->setupUi(this);
+	QString version = "";
+	m_ui->tabWidget->setCurrentIndex(0);
+	m_ui->checkBoxShowDebug->setChecked(false);
+	m_ui->frameDebug->setVisible(false);
+
+	m_trace = new TraceWidget(this);
+	QVBoxLayout *layout = new QVBoxLayout();
+	layout->addWidget(m_trace);
+	m_ui->frameTrace->setLayout(layout);
+
+	new QShortcut(QKeySequence(Qt::Key_Up), this, SLOT(selectPrevRow()));
+	new QShortcut(QKeySequence(Qt::Key_Down), this, SLOT(selectNextRow()));
+	new QShortcut(QKeySequence(Qt::Key_Return),  this, SLOT(changeValue()));
+	new QShortcut(QKeySequence(Qt::Key_Escape),  m_ui->lineEditFilter, SLOT(clear()));
+
+	readSettings();
+	initialize();
+
+	connect(m_ui->pushButtonStart, SIGNAL(clicked()), m_device, SLOT(start()));
+	connect(m_ui->pushButtonStop, SIGNAL(clicked()), m_device, SLOT(stop()));
+	connect(m_ui->pushButtonSnooze, SIGNAL(clicked()), m_device, SLOT(snooze()));
+	connect(m_ui->pushButtonAck, SIGNAL(clicked()), m_device, SLOT(ack()));
+	connect(m_ui->pushButtonTestStart, SIGNAL(clicked()), m_device, SLOT(testStart()));
+	connect(m_ui->pushButtonTestStop, SIGNAL(clicked()), m_device, SLOT(testStop()));
+	connect(m_ui->tableWidgetRegisters, SIGNAL(itemActivated(QTableWidgetItem*)), this, SLOT(changeValue(QTableWidgetItem*)));
+	connect(m_ui->tableWidgetDebug, SIGNAL(itemActivated(QTableWidgetItem*)), this, SLOT(changeValue(QTableWidgetItem*)));
+	connect(m_ui->tableWidgetPersonalized, SIGNAL(itemActivated(QTableWidgetItem*)), this, SLOT(changeValue(QTableWidgetItem*)));
+	connect(m_ui->lineEditFilter, SIGNAL(textChanged(QString)), this, SLOT(filterRegistersTable(QString)));
+	connect(m_ui->pushButtonPersonalizedAdd, SIGNAL(clicked()), this, SLOT(addToPersonalized()));
+	connect(m_ui->pushButtonPersonalizedRemove, SIGNAL(clicked()), this, SLOT(removeFromPersonalized()));
+	connect(m_ui->pushButtonPersonalizedClear, SIGNAL(clicked()), this, SLOT(clearPersonalized()));
+	connect(m_ui->pushButtonPersonalizedAddAll, SIGNAL(clicked()), this, SLOT(addAllToPersonalized()));
+	connect(m_ui->pushButtonRec, SIGNAL(clicked()), this, SLOT(recLog()));
+	connect(m_ui->pushButtonRecStop, SIGNAL(clicked()), this, SLOT(stopLog()));
+	connect(m_ui->pushButtonSaveRegisters, SIGNAL(clicked()), this, SLOT(saveRegisters()));
+	connect(m_ui->pushButtonUploadRegisters, SIGNAL(clicked()), this, SLOT(uploadRegisters()));
+
+	m_traceTimer = new QTimer();
+	connect(m_ui->comboBoxTraceSampleTime, SIGNAL(currentIndexChanged(int)), this, SLOT(sampleTimeChanged(int)));
+	connect(m_traceTimer, SIGNAL(timeout()), this, SLOT(updateTrace()));
+	m_traceTimer->start(m_ui->comboBoxTraceSampleTime->currentText().toInt() * 1000);
+
+	m_ui->tableWidgetRegisters->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->tableWidgetInputs->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->tableWidgetOutputs->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->tableWidgetDebug->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->tableWidgetPersonalized->setContextMenuPolicy(Qt::CustomContextMenu);
+	connect(m_ui->tableWidgetRegisters, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(showCustomMenuMain(QPoint)));
+	connect(m_ui->tableWidgetInputs, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(showCustomMenuInputs(QPoint)));
+	connect(m_ui->tableWidgetOutputs, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(showCustomMenuOutputs(QPoint)));
+	connect(m_ui->tableWidgetDebug, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(showCustomMenuDebug(QPoint)));
+	connect(m_ui->tableWidgetPersonalized, SIGNAL(customContextMenuRequested(QPoint)), this, SLOT(showCustomMenuPersonalized(QPoint)));
+
+	connect(m_ui->pushButtonTraceClear, SIGNAL(clicked()), m_trace, SLOT(clear()));
+
+	m_logTimer = new QTimer();
+
+	m_ui->labelRunning->setVisible(m_device->containsTag("RUNNING"));
+	m_ui->labelWarning->setVisible(m_device->containsTag("WARNING"));
+	m_ui->labelFailure->setVisible(m_device->containsTag("FAILURE"));
+	m_ui->labelTestMode->setVisible(m_device->containsTag("TEST_MODE"));
+	m_ui->labelTestMode2->setVisible(m_device->containsTag("TEST_MODE"));
+	m_ui->pushButtonStart->setVisible(m_device->containsTag("START"));
+	m_ui->pushButtonStop->setVisible(m_device->containsTag("STOP"));
+	m_ui->pushButtonAck->setVisible(m_device->containsTag("ACK"));
+	m_ui->pushButtonSnooze->setVisible(m_device->containsTag("SNOOZE"));
+	m_ui->pushButtonTestStart->setVisible(m_device->containsTag("TEST_START"));
+	m_ui->pushButtonTestStop->setVisible(m_device->containsTag("TEST_STOP"));
+}
+
+DeviceWidget::~DeviceWidget(){
+	saveSettings();
+	stopLog();
+	m_traceTimer->stop();
+
+	reallyQuitTableThread(m_tableRegisterUpdateThread);
+	reallyQuitTableThread(m_tableInputUpdateThread);
+	reallyQuitTableThread(m_tableOutputUpdateThread);
+	reallyQuitTableThread(m_tableDebugUpdateThread);
+	reallyQuitTableThread(m_tablePersonalizedUpdateThread);
+	qApp->processEvents();
+
+	delete m_logTimer;
+	delete m_traceTimer;
+	delete m_trace;
+	delete m_ui;
+}
+
+
+void DeviceWidget::reallyQuitTableThread(QThread *thread){
+	if(thread != NULL){
+		quint16 count = 0;
+		while(!thread->isFinished()){
+			PVNN_DEBUG<<"Quitting table update thread thread "<<count;
+			if(count < 250){
+				thread->quit();
+				QThread::msleep(50);
+			}
+			else{
+				PVNN_DEBUG<<"Terminating thread!!!! ";
+				thread->terminate();
+				count = 0;
+			}
+			count++;
+		}
+	}
+}
+
+void DeviceWidget::setVisible(bool visible){
+	QWidget::setVisible(visible);
+	focusToFilter();
+	update();
+}
+
+void DeviceWidget::saveSettings(){
+	if(m_cfg != ""){
+		QSettings settings(m_cfg , QSettings::IniFormat);
+		settings.beginGroup("DeviceWidget" + QString::number(m_device->id()));
+		settings.setValue("trace_addr0", m_ui->lineEditTraceAddress0->text());
+		settings.setValue("trace_addr1", m_ui->lineEditTraceAddress1->text());
+		settings.setValue("trace_addr2", m_ui->lineEditTraceAddress2->text());
+		settings.setValue("trace_addr3", m_ui->lineEditTraceAddress3->text());
+		settings.setValue("trace_addr4", m_ui->lineEditTraceAddress4->text());
+		settings.setValue("trace_addr5", m_ui->lineEditTraceAddress5->text());
+		settings.setValue("trace_min1", m_ui->lineEditMin1->text());
+		settings.setValue("trace_max1", m_ui->lineEditMax1->text());
+		settings.setValue("trace_min2", m_ui->lineEditMin2->text());
+		settings.setValue("trace_max2", m_ui->lineEditMax2->text());
+		settings.setValue("trace_scale0", m_ui->comboBoxTrace0->currentIndex());
+		settings.setValue("trace_scale1", m_ui->comboBoxTrace1->currentIndex());
+		settings.setValue("trace_scale2", m_ui->comboBoxTrace2->currentIndex());
+		settings.setValue("trace_scale3", m_ui->comboBoxTrace3->currentIndex());
+		settings.setValue("trace_scale4", m_ui->comboBoxTrace4->currentIndex());
+		settings.setValue("trace_scale5", m_ui->comboBoxTrace5->currentIndex());
+		settings.setValue("trace_sampleTime", m_ui->comboBoxTraceSampleTime->currentIndex());
+		settings.setValue("personalizedAddresses", m_personalizedAddresses);
+		settings.setValue("logDir", m_logDir);
+		settings.setValue("registersDir", m_registersDir);
+
+		settings.endGroup();
+	}
+}
+
+void DeviceWidget::readSettings(){
+	QSettings settings(m_cfg , QSettings::IniFormat);
+
+	settings.beginGroup("DeviceWidget" + QString::number(m_device->id()));
+	m_ui->lineEditTraceAddress0->setText(settings.value("trace_addr0", "").toString());
+	m_ui->lineEditTraceAddress1->setText(settings.value("trace_addr1", "").toString());
+	m_ui->lineEditTraceAddress2->setText(settings.value("trace_addr2", "").toString());
+	m_ui->lineEditTraceAddress3->setText(settings.value("trace_addr3", "").toString());
+	m_ui->lineEditTraceAddress4->setText(settings.value("trace_addr4", "").toString());
+	m_ui->lineEditTraceAddress5->setText(settings.value("trace_addr5", "").toString());
+	m_ui->lineEditMin1->setText(settings.value("trace_min1", "0").toString());
+	m_ui->lineEditMax1->setText(settings.value("trace_max1", "0").toString());
+	m_ui->lineEditMin2->setText(settings.value("trace_min2", "0").toString());
+	m_ui->lineEditMax2->setText(settings.value("trace_max2", "0").toString());
+	m_ui->comboBoxTrace0->setCurrentIndex(settings.value("trace_scale0", 0).toInt());
+	m_ui->comboBoxTrace1->setCurrentIndex(settings.value("trace_scale1", 0).toInt());
+	m_ui->comboBoxTrace2->setCurrentIndex(settings.value("trace_scale2", 0).toInt());
+	m_ui->comboBoxTrace3->setCurrentIndex(settings.value("trace_scale3", 0).toInt());
+	m_ui->comboBoxTrace4->setCurrentIndex(settings.value("trace_scale4", 0).toInt());
+	m_ui->comboBoxTrace5->setCurrentIndex(settings.value("trace_scale5", 0).toInt());
+	m_ui->comboBoxTraceSampleTime->setCurrentIndex(settings.value("trace_sample", 0).toInt());
+	m_personalizedAddresses = settings.value("personalizedAddresses").toStringList();
+	m_logDir = settings.value("logDir", "C:\\").toString();
+	m_registersDir = settings.value("registersDir", "C:\\").toString();
+	settings.endGroup();
+}
+
+void DeviceWidget::initialize(){
+	initializeTable(m_ui->tableWidgetRegisters, m_device->sortedAddresses());
+	initializeTable(m_ui->tableWidgetInputs, m_device->sortedInsAddresses());
+	initializeTable(m_ui->tableWidgetOutputs, m_device->sortedOutsAddresses());
+	initializeTable(m_ui->tableWidgetDebug, m_device->sortedDebugAddresses());
+	initializeTable(m_ui->tableWidgetPersonalized, m_personalizedAddresses);
+}
+
+void DeviceWidget::initializeTable(QTableWidget *table, QStringList addresses){
+	while(table->rowCount() > 0){
+		table->removeRow(0);
+	}
+	table->setColumnCount(6);
+	QStringList headers;
+	headers << tr("Indirizzo");
+	headers << tr("Bit");
+	headers << tr("Descrizione");
+	headers << tr("Valore");
+	headers << tr("Unità");
+	headers << tr("");
+	table->setHorizontalHeaderLabels(headers);
+
+	bool switcher = false;
+	quint16 lastreg = 0;
+	foreach (QString addr, addresses){
+		if(m_device->containsAddress(addr)){
+			PvnnModbusDriverItem *item = m_device->itemAt(addr);
+			QStringList texts;
+			texts<<QString::number(item->reg());
+			if(item->bit() >= 0){
+				texts<<QString::number(item->bit());
+			}
+			else{
+				texts<<"";
+			}
+			texts<<item->description();
+			texts<<item->value();
+			if(item->unit() == "#"){
+				texts<<"";
+			}
+			else{
+				texts<<item->unit();
+			}
+			texts<<"";				// inserisco ultimo elemento vuoto
+			table->insertRow(table->rowCount());
+			int row = table->rowCount() - 1;
+			bool hide = false;
+			if(lastreg != item->reg()){
+				switcher = not switcher;
+				lastreg = item->reg();
+			}
+			else{
+				hide = true;
+			}
+			for(int j = 0; j < 6; j++){
+				QTableWidgetItem *twi = new QTableWidgetItem();
+				table->setItem(row, j, twi);
+				twi->setText(texts[j]);
+				if(item->isWritable()){
+					if(switcher){
+						twi->setBackground(PVNN_ORANGE_1);
+					}
+					else{
+						twi->setBackground(PVNN_ORANGE_2);
+					}
+				}
+				else{
+					if(switcher){
+						twi->setBackground(PVNN_CYAN_1);
+					}
+					else{
+						twi->setBackground(PVNN_CYAN_2);
+					}
+				}
+				if(j == 0){
+					if(hide){
+						// farfugliata per nascondere l'indirizzo
+						QFont font = twi->font();
+						font.setPointSize(7);
+						twi->setFont(font);
+						twi->setTextAlignment(Qt::AlignRight);
+						twi->setTextColor(PVNN_GRAY_1);
+					}
+					else{
+						QFont font = twi->font();
+						font.setBold(true);
+						twi->setFont(font);
+					}
+				}
+				if(j==5){
+					// nel tooltip sull'ultima colonna metto un po' di infromazioni utili per pvnn
+					QString tip;
+					QTextStream stream(&tip, QIODevice::WriteOnly);
+					stream<<"Device:"<<"\t"<<item->device()<<endl;
+					stream<<"Register:"<<"\t"<<item->reg()<<endl;
+					stream<<"Bit:"<<"\t"<<item->bit()<<endl;
+					stream<<"Tag:"<<"\t"<<item->tag()<<endl;
+					stream<<"Type:"<<"\t"<<item->type()<<endl;
+					stream<<"Unit:"<<"\t"<<item->unit()<<endl;
+					stream<<"Choices:"<<"\t"<<item->choices().join(":")<<endl;
+					stream<<"Factor:"<<"\t"<<item->factor()<<endl;
+					stream<<"Writable:"<<"\t"<<item->isWritable()<<endl;
+					stream<<"Min:"<<"\t"<<item->min()<<endl;
+					stream<<"Max:"<<"\t"<<item->max()<<endl;
+					stream<<"Relmin:"<<"\t"<<item->isMinRelative()<<endl;
+					stream<<"Relmax:"<<"\t"<<item->isMaxRelative()<<endl;
+					twi->setToolTip(tip);
+				}
+			}
+		}
+	}
+	table->setVisible(false);
+	table->resizeColumnsToContents();
+	table->setVisible(true);
+	table->horizontalHeader()->setStretchLastSection(true);
+}
+
+void DeviceWidget::update(){
+	if(isVisible()){
+		updateRegisterTable();
+		updateInputTable();
+		updateOutputTable();
+		updateDebugTable();
+		updatePersonalizedTable();
+		
+		updateAlerts();
+		updateStatus();
+		updateTraceInfo();
+	}
+}
+
+QString DeviceWidget::addressAt(QTableWidget *table, int row){
+	QString addr = table->item(row, 0)->text();
+	bool ok;
+	int bit = table->item(row, 1)->text().toInt(&ok);
+	if(ok){
+		addr = addr + "." + QString("%1").arg(bit, 2, 10, QChar('0'));
+	}
+	return addr;
+}
+
+void DeviceWidget::updateRegisterTable(){
+	if(m_tableRegisterUpdateThread == NULL){
+		TableUpdater *tabler = new TableUpdater(m_device, m_ui->tableWidgetRegisters, COLUMN_VAL);
+		QThread* thread = new QThread();
+		tabler->moveToThread(thread);
+		connect(thread, SIGNAL(started()), tabler, SLOT(process()));
+		connect(tabler, SIGNAL(finished()), thread, SLOT(quit()));
+		connect(tabler, SIGNAL(finished()), tabler, SLOT(deleteLater()));
+		connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+		connect(tabler, SIGNAL(finished()), m_ui->tableWidgetRegisters->viewport(), SLOT(update()));	// serve per rinfrescare la visualizzazione dei dati
+		connect(thread, SIGNAL(destroyed()), this, SLOT(tableRegisterUpdateDone()));
+		m_tableRegisterUpdateThread = thread;
+		thread->start();
+	}
+}
+
+void DeviceWidget::updateInputTable(){
+	if(m_tableInputUpdateThread == NULL){
+		TableUpdater *tabler = new TableUpdater(m_device, m_ui->tableWidgetInputs, COLUMN_VAL);
+		QThread* thread = new QThread();
+		tabler->moveToThread(thread);
+		connect(thread, SIGNAL(started()), tabler, SLOT(process()));
+		connect(tabler, SIGNAL(finished()), thread, SLOT(quit()));
+		connect(tabler, SIGNAL(finished()), tabler, SLOT(deleteLater()));
+		connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+		connect(tabler, SIGNAL(finished()), m_ui->tableWidgetInputs->viewport(), SLOT(update()));	// serve per rinfrescare la visualizzazione dei dati
+		connect(thread, SIGNAL(destroyed()), this, SLOT(tableInputUpdateDone()));
+		m_tableInputUpdateThread = thread;
+		thread->start();
+	}
+}
+
+void DeviceWidget::updateOutputTable(){
+	if(m_tableOutputUpdateThread == NULL){
+		TableUpdater *tabler = new TableUpdater(m_device, m_ui->tableWidgetOutputs, COLUMN_VAL);
+		QThread* thread = new QThread();
+		tabler->moveToThread(thread);
+		connect(thread, SIGNAL(started()), tabler, SLOT(process()));
+		connect(tabler, SIGNAL(finished()), thread, SLOT(quit()));
+		connect(tabler, SIGNAL(finished()), tabler, SLOT(deleteLater()));
+		connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+		connect(tabler, SIGNAL(finished()), m_ui->tableWidgetOutputs->viewport(), SLOT(update()));	// serve per rinfrescare la visualizzazione dei dati
+		connect(thread, SIGNAL(destroyed()), this, SLOT(tableOutputUpdateDone()));
+		m_tableOutputUpdateThread = thread;
+		thread->start();
+	}
+}
+
+void DeviceWidget::updateDebugTable(){
+	if(m_tableDebugUpdateThread == NULL){
+		TableUpdater *tabler = new TableUpdater(m_device, m_ui->tableWidgetDebug, COLUMN_VAL);
+		QThread* thread = new QThread();
+		tabler->moveToThread(thread);
+		connect(thread, SIGNAL(started()), tabler, SLOT(process()));
+		connect(tabler, SIGNAL(finished()), thread, SLOT(quit()));
+		connect(tabler, SIGNAL(finished()), tabler, SLOT(deleteLater()));
+		connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+		connect(tabler, SIGNAL(finished()), m_ui->tableWidgetDebug->viewport(), SLOT(update()));	// serve per rinfrescare la visualizzazione dei dati
+		connect(thread, SIGNAL(destroyed()), this, SLOT(tableDebugUpdateDone()));
+		m_tableDebugUpdateThread = thread;
+		thread->start();
+	}
+}
+
+void DeviceWidget::updatePersonalizedTable(){
+	if(m_tablePersonalizedUpdateThread == NULL){
+		TableUpdater *tabler = new TableUpdater(m_device, m_ui->tableWidgetPersonalized, COLUMN_VAL);
+		QThread* thread = new QThread();
+		tabler->moveToThread(thread);
+		connect(thread, SIGNAL(started()), tabler, SLOT(process()));
+		connect(tabler, SIGNAL(finished()), thread, SLOT(quit()));
+		connect(tabler, SIGNAL(finished()), tabler, SLOT(deleteLater()));
+		connect(thread, SIGNAL(finished()), thread, SLOT(deleteLater()));
+		connect(tabler, SIGNAL(finished()), m_ui->tableWidgetPersonalized->viewport(), SLOT(update()));	// serve per rinfrescare la visualizzazione dei dati
+		connect(thread, SIGNAL(destroyed()), this, SLOT(tablePersonalizedUpdateDone()));
+		m_tablePersonalizedUpdateThread = thread;
+		thread->start();
+	}
+}
+
+void DeviceWidget::updateAlerts(){
+	m_ui->listWidgetAlerts->clear();
+	bool switcher = false;
+	foreach(QString fail, m_device->activeFailures()){
+		QListWidgetItem *item = new QListWidgetItem();
+		item->setText(fail);
+		if(switcher){
+			item->setBackgroundColor(PVNN_RED_2);
+		}
+		else{
+			item->setBackgroundColor(PVNN_RED_1);
+		}
+		m_ui->listWidgetAlerts->addItem(item);
+		switcher = not switcher;
+	}
+	foreach(QString warn, m_device->activeWarnings()){
+		QListWidgetItem *item = new QListWidgetItem();
+		item->setText(warn);
+		if(switcher){
+			item->setBackgroundColor(PVNN_YELLOW_2);
+		}
+		else{
+			item->setBackgroundColor(PVNN_YELLOW_1);
+		}
+		m_ui->listWidgetAlerts->addItem(item);
+		switcher = not switcher;
+	}
+}
+
+void DeviceWidget::updateStatus(){
+	if(m_device->containsTag("RUNNING")){
+		if(m_device->byTag("RUNNING")->boolValue()){
+			m_ui->labelRunning->setPalette(QPalette(PVNN_GREEN_1));
+		}
+		else{
+			m_ui->labelRunning->setPalette(QPalette(PVNN_GRAY_1));
+		}
+	}
+	if(m_device->containsTag("TEST_MODE")){
+		if(m_device->byTag("TEST_MODE")->boolValue()){
+			m_ui->labelTestMode->setPalette(QPalette(PVNN_CYAN_2));
+			m_ui->labelTestMode2->setPalette(QPalette(PVNN_CYAN_2));
+		}
+		else{
+			m_ui->labelTestMode->setPalette(QPalette(PVNN_GRAY_1));
+			m_ui->labelTestMode2->setPalette(QPalette(PVNN_GRAY_1));
+		}
+	}
+	if(m_device->containsTag("WARNING")){
+		if(m_device->byTag("WARNING")->boolValue()){
+			m_ui->labelWarning->setPalette(QPalette(PVNN_YELLOW_1));
+		}
+		else{
+			m_ui->labelWarning->setPalette(QPalette(PVNN_GRAY_1));
+		}
+	}
+	if(m_device->containsTag("FAILURE")){
+		if(m_device->byTag("FAILURE")->boolValue()){
+			m_ui->labelFailure->setPalette(QPalette(PVNN_RED_1));
+		}
+		else{
+			m_ui->labelFailure->setPalette(QPalette(PVNN_GRAY_1));
+		}
+
+	}
+}
+
+void DeviceWidget::updateTraceInfo(){
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress0->text())){
+		m_ui->labelDesc0->setText(m_device->itemAt(m_ui->lineEditTraceAddress0->text())->description());
+		m_ui->labelValue0->setText(m_device->itemAt(m_ui->lineEditTraceAddress0->text())->value());
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress1->text())){
+		m_ui->labelDesc1->setText(m_device->itemAt(m_ui->lineEditTraceAddress1->text())->description());
+		m_ui->labelValue1->setText(m_device->itemAt(m_ui->lineEditTraceAddress1->text())->value());
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress2->text())){
+		m_ui->labelDesc2->setText(m_device->itemAt(m_ui->lineEditTraceAddress2->text())->description());
+		m_ui->labelValue2->setText(m_device->itemAt(m_ui->lineEditTraceAddress2->text())->value());
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress3->text())){
+		m_ui->labelDesc3->setText(m_device->itemAt(m_ui->lineEditTraceAddress3->text())->description());
+		m_ui->labelValue3->setText(m_device->itemAt(m_ui->lineEditTraceAddress3->text())->value());
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress4->text())){
+		m_ui->labelDesc4->setText(m_device->itemAt(m_ui->lineEditTraceAddress4->text())->description());
+		m_ui->labelValue4->setText(m_device->itemAt(m_ui->lineEditTraceAddress4->text())->value());
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress5->text())){
+		m_ui->labelDesc5->setText(m_device->itemAt(m_ui->lineEditTraceAddress5->text())->description());
+		m_ui->labelValue5->setText(m_device->itemAt(m_ui->lineEditTraceAddress5->text())->value());
+	}
+}
+
+void DeviceWidget::focusToFilter(){
+	if(m_ui->tabWidget->currentIndex() == TAB_REG){
+		m_ui->lineEditFilter->setFocus();
+	}
+
+}
+
+void DeviceWidget::changeValue(){
+	QTableWidget *table = NULL;
+	if(m_ui->tabWidget->currentIndex() == TAB_REG){
+		table = m_ui->tableWidgetRegisters;
+	}
+	if(m_ui->tabWidget->currentIndex() == TAB_PERSONAL){
+		table = m_ui->tableWidgetPersonalized;
+	}
+	if(table != NULL){
+		if(table->selectedItems().size() > 0){
+			QTableWidgetItem *item = table->item(table->selectedItems()[0]->row(), COLUMN_VAL);
+			changeValue(item);
+		}
+	}
+}
+
+void DeviceWidget::changeValue(QTableWidgetItem *twi){
+	QString addr = addressAt(twi->tableWidget(), twi->row());
+	if(m_device->containsAddress(addr)){
+		PvnnModbusDriverItem *item = m_device->itemAt(addr);
+		if(item->isWritable()){
+			if(item->isSerialNumberPart()){
+				// il serial number non si può cambiare.
+				;
+			}
+			else if(item->isMaterialNamePart()){
+				bool ok;
+				QString name = QInputDialog::getText(this, "DruidLab", tr("Nome del materiale"), QLineEdit::Normal, m_device->materialName(), &ok);
+				if(ok){
+					m_device->setMaterialName(name);
+					twi->tableWidget()->item(twi->row(), COLUMN_VAL)->setText("*" + name);
+				}
+			}
+			else{
+				InputDialog dialog(this, item);
+				if(dialog.exec() == QDialog::Accepted){
+					twi->tableWidget()->item(twi->row(), COLUMN_VAL)->setText("*" + dialog.tentativeValue());
+				}
+			}
+		}
+	}
+}
+
+void DeviceWidget::sampleTimeChanged(int index){
+	m_traceTimer->stop();
+	m_traceTimer->setInterval(m_ui->comboBoxTraceSampleTime->itemText(index).toInt() * 1000);
+	m_traceTimer->start();
+}
+
+void DeviceWidget::updateTrace(){
+	float v0 = 0, v1 = 0, v2 = 0, v3 = 0, v4 = 0, v5 = 0;
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress0->text())){
+		v0 = m_device->itemAt(m_ui->lineEditTraceAddress0->text())->value().toFloat();
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress1->text())){
+		v1 = m_device->itemAt(m_ui->lineEditTraceAddress1->text())->value().toFloat();
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress2->text())){
+		v2 = m_device->itemAt(m_ui->lineEditTraceAddress2->text())->value().toFloat();
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress3->text())){
+		v3 = m_device->itemAt(m_ui->lineEditTraceAddress3->text())->value().toFloat();
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress4->text())){
+		v4 = m_device->itemAt(m_ui->lineEditTraceAddress4->text())->value().toFloat();
+	}
+	if(m_device->containsAddress(m_ui->lineEditTraceAddress5->text())){
+		v5 = m_device->itemAt(m_ui->lineEditTraceAddress5->text())->value().toFloat();
+	}
+
+	float min1 = m_ui->lineEditMin1->text().toFloat();
+	float max1 = m_ui->lineEditMax1->text().toFloat();
+	float min2 = m_ui->lineEditMin2->text().toFloat();
+	float max2 = m_ui->lineEditMax2->text().toFloat();
+
+	m_trace->setScale1(min1, max1);
+	m_trace->setScale2(min2, max2);
+
+	m_trace->setTraceScale(0, m_ui->comboBoxTrace0->currentIndex());
+	m_trace->setTraceScale(1, m_ui->comboBoxTrace1->currentIndex());
+	m_trace->setTraceScale(2, m_ui->comboBoxTrace2->currentIndex());
+	m_trace->setTraceScale(3, m_ui->comboBoxTrace3->currentIndex());
+	m_trace->setTraceScale(4, m_ui->comboBoxTrace4->currentIndex());
+	m_trace->setTraceScale(5, m_ui->comboBoxTrace5->currentIndex());
+
+	m_trace->push(v0, v1, v2, v3, v4, v5);
+}
+
+void DeviceWidget::filterRegistersTable(QString text){
+	for(int i = 0; i < m_ui->tableWidgetRegisters->rowCount(); i++){
+		bool unmatched = (text != "") and not (m_ui->tableWidgetRegisters->item(i, COLUMN_DESC)->text().contains(text, Qt::CaseInsensitive));
+		m_ui->tableWidgetRegisters->setRowHidden(i, unmatched);
+	}
+}
+
+void DeviceWidget::setCurrentTab(int index){
+	m_ui->tabWidget->setCurrentIndex(index);
+}
+
+void DeviceWidget::selectPrevRow(){
+	QTableWidget *table = NULL;
+	if(m_ui->tabWidget->currentIndex() == TAB_REG){
+		table = m_ui->tableWidgetRegisters;
+	}
+	if(m_ui->tabWidget->currentIndex() == TAB_PERSONAL){
+		table = m_ui->tableWidgetPersonalized;
+	}
+
+	if(table != NULL){
+		int current = 1;
+		if(table->selectedItems().size() > 0){
+			current = table->selectedItems()[0]->row();
+		}
+		current--;
+		if(current < 0){
+			current = 0;
+		}
+		table->selectRow(current);
+		table->scrollToItem(table->item(current,0));
+	}
+}
+
+void DeviceWidget::selectNextRow(){
+	QTableWidget *table = NULL;
+	if(m_ui->tabWidget->currentIndex() == TAB_REG){
+		table = m_ui->tableWidgetRegisters;
+	}
+	if(m_ui->tabWidget->currentIndex() == TAB_IO){
+		table = m_ui->tableWidgetDebug;
+	}
+	if(m_ui->tabWidget->currentIndex() == TAB_PERSONAL){
+		table = m_ui->tableWidgetPersonalized;
+	}
+
+	if(table != NULL){
+		int current = -1;
+		if(table->selectedItems().size() > 0){
+			current = table->selectedItems()[0]->row();
+		}
+		current++;
+		if(current >= table->rowCount()){
+			current = table->rowCount() - 1;
+		}
+		table->selectRow(current);
+		table->scrollToItem(table->item(current,0));
+	}
+}
+
+void DeviceWidget::traceAddress(int index, QString address){
+
+	if(index == 0){
+		m_ui->lineEditTraceAddress0->setText(address);
+	}
+	else if(index == 1){
+		m_ui->lineEditTraceAddress1->setText(address);
+	}
+	else if(index == 2){
+		m_ui->lineEditTraceAddress2->setText(address);
+	}
+	else if(index == 3){
+		m_ui->lineEditTraceAddress3->setText(address);
+	}
+	else if(index == 4){
+		m_ui->lineEditTraceAddress4->setText(address);
+	}
+	else if(index == 5){
+		m_ui->lineEditTraceAddress5->setText(address);
+	}
+	updateTraceInfo();
+
+}
+
+void DeviceWidget::showCustomMenuMain(QPoint pos){
+	showCustomMenu(m_ui->tableWidgetRegisters, pos);
+}
+
+void DeviceWidget::showCustomMenuInputs(QPoint pos){
+	showCustomMenu(m_ui->tableWidgetInputs, pos);
+}
+
+void DeviceWidget::showCustomMenuOutputs(QPoint pos){
+	showCustomMenu(m_ui->tableWidgetOutputs, pos);
+}
+
+void DeviceWidget::showCustomMenuDebug(QPoint pos){
+	showCustomMenu(m_ui->tableWidgetDebug, pos);
+}
+
+void DeviceWidget::showCustomMenuPersonalized(QPoint pos){
+	showCustomMenu(m_ui->tableWidgetPersonalized, pos);
+}
+
+void DeviceWidget::showCustomMenu(QTableWidget *table, QPoint pos){
+	QMenu menu(this);
+	QAction *trace0 = menu.addAction(tr("Traccia (ciano)"));
+	QAction *trace1 = menu.addAction(tr("Traccia (giallo)"));
+	QAction *trace2 = menu.addAction(tr("Traccia (rosso)"));
+	QAction *trace3 = menu.addAction(tr("Traccia (verde)"));
+	QAction *trace4 = menu.addAction(tr("Traccia (arancio)"));
+	QAction *trace5 = menu.addAction(tr("Traccia (fuxia)"));
+	QAction *addToPersonalizedTable = menu.addAction(tr("Aggiungi alla tabella personalizzata"));
+	addToPersonalizedTable->setEnabled(not m_logging);
+	QAction *a = menu.exec(table->viewport()->mapToGlobal(pos));
+	QString address = addressAt(table, table->itemAt(pos)->row());
+
+	if (a == trace0){
+		traceAddress(0, address);
+	}
+	else if (a == trace1){
+		traceAddress(1, address);
+	}
+	else if (a == trace2){
+		traceAddress(2, address);
+	}
+	else if (a == trace3){
+		traceAddress(3, address);
+	}
+	else if (a == trace4){
+		traceAddress(4, address);
+	}
+	else if (a == trace5){
+		traceAddress(5, address);
+	}
+	else if(a == addToPersonalizedTable){
+		addToPersonalized(address);
+	}
+}
+
+bool DeviceWidget::addToPersonalized(QString address){
+	bool done = false;
+	if(m_device->containsAddress(address) and not m_personalizedAddresses.contains(address)){
+		m_personalizedAddresses<<address;
+		qSort(m_personalizedAddresses);
+		initializeTable(m_ui->tableWidgetPersonalized, m_personalizedAddresses);
+		done = true;
+	}
+	return done;
+}
+
+void DeviceWidget::clearPersonalized(){
+	m_personalizedAddresses.clear();
+	initializeTable(m_ui->tableWidgetPersonalized, m_personalizedAddresses);
+}
+
+void DeviceWidget::addToPersonalized(){
+	bool ok;
+	QString addr = QInputDialog::getText(this, "DruidLab", "Indirizzo",QLineEdit::Normal, "", &ok);
+	if(ok){
+		addToPersonalized(addr);
+	}
+
+}
+
+void DeviceWidget::removeFromPersonalized(){
+	if(m_ui->tableWidgetPersonalized->selectedItems().size() > 0){
+		int row = m_ui->tableWidgetPersonalized->selectedItems()[0]->row();
+		QString addr = addressAt(m_ui->tableWidgetPersonalized, row);
+		m_personalizedAddresses.removeOne(addr);
+		m_ui->tableWidgetPersonalized->removeRow(row);
+	}
+
+}
+
+void DeviceWidget::recLog(){
+	if(not m_personalizedAddresses.isEmpty() and not m_logging){
+		QString path = QFileDialog::getSaveFileName(this, tr("DruidLab - File di log"),  m_logDir, tr("CSV file (*.csv)"));
+		QFileInfo finfo(path);
+		if(path != ""){
+			m_logDir = finfo.absolutePath();
+			prepareRecording(finfo.absoluteFilePath());
+			recNow();
+			connect(m_logTimer, SIGNAL(timeout()), this, SLOT(recNow()));
+			m_logTimer->start(m_ui->comboBoxRecSampleTime->currentText().toInt() * 1000);
+			m_logging = true;
+		}
+	}
+
+}
+
+void DeviceWidget::prepareRecording(QString path){
+	m_logPath = path;
+	QString line;
+	QTextStream out(&line);
+	out.setCodec("UTF-8");
+	out<<QDate::currentDate().toString("yyyy-MM-dd")<<";";
+	for(int i = 0; i < m_personalizedAddresses.length(); i++){
+		out<<m_personalizedAddresses[i] + " - " + m_device->itemAt(m_personalizedAddresses[i])->description() + ";";
+	}
+	if(!Logger::log(m_logPath, line)){
+		QMessageBox::information(this, tr("DruidLab - Errore nei log"), tr("Impossibile scrivere il file di log:") + m_logPath);
+	}
+	m_logCount = 0;
+	m_ui->labelRec->setText("REC[" + QString::number(m_logCount) + "]");
+
+	m_ui->pushButtonPersonalizedAdd->setEnabled(false);
+	m_ui->pushButtonPersonalizedAddAll->setEnabled(false);
+	m_ui->pushButtonPersonalizedClear->setEnabled(false);
+	m_ui->pushButtonPersonalizedRemove->setEnabled(false);
+	m_ui->comboBoxRecSampleTime->setEnabled(false);
+
+}
+
+void DeviceWidget::recNow(){
+	QString line;
+	QTextStream out(&line);
+	out.setCodec("UTF-8");
+	out<<QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss")<<";";
+	for(int i = 0; i < m_personalizedAddresses.length(); i++){
+		out<<m_device->itemAt(m_personalizedAddresses[i])->value() + ";";
+	}
+	if(!Logger::log(m_logPath, line)){
+		QMessageBox::information(this, tr("DruidLab - Errore nei log"), tr("Impossibile scrivere il file di log:") + m_logPath);
+	}
+	m_logCount++;
+	m_ui->labelRec->setText("REC[" + QString::number(m_logCount) + "]");
+	m_ui->labelRec->setPalette(QPalette(PVNN_RED_1));
+}
+
+void DeviceWidget:: stopLog(){
+	m_logTimer->stop();
+	disconnect(m_logTimer, SIGNAL(timeout()), this, SLOT(recNow()));
+	m_ui->labelRec->setPalette(QPalette(PVNN_GRAY_2));
+	m_logging = false;
+	m_ui->pushButtonPersonalizedAdd->setEnabled(true);
+	m_ui->pushButtonPersonalizedAddAll->setEnabled(true);
+	m_ui->pushButtonPersonalizedClear->setEnabled(true);
+	m_ui->pushButtonPersonalizedRemove->setEnabled(true);
+	m_ui->comboBoxRecSampleTime->setEnabled(true);
+
+}
+
+void DeviceWidget::addAllToPersonalized(){
+	m_personalizedAddresses.clear();
+	foreach(QString addr, m_device->sortedAddresses()){
+		m_personalizedAddresses<<addr;
+	}
+	qSort(m_personalizedAddresses);
+	initializeTable(m_ui->tableWidgetPersonalized, m_personalizedAddresses);
+}
+
+void DeviceWidget::saveRegisters(){
+	QString path = QFileDialog::getSaveFileName(this, tr("DruidLab - Salva dati"), m_registersDir , tr("File di dati di DruidLab (*.shd)"));
+	QFileInfo finfo(path);
+	if(path != ""){
+		m_registersDir = finfo.absolutePath();
+		PvnnModbusDriverDevice::Error err = m_device->saveRegisters(path);
+		if(err != PvnnModbusDriverDevice::NoError){
+			QMessageBox::critical(this, "DruidLab", tr("Errore di salvataggio dei dati"));
+		}
+	}
+
+}
+
+void DeviceWidget::uploadRegisters(){
+	QString path = QFileDialog::getOpenFileName(this, tr("DruidLab - Carica dati"), m_registersDir, tr("File di dati di DruidLab (*.shd)"));
+	QFileInfo finfo(path);
+	if(path != ""){
+		m_registersDir = finfo.absolutePath();
+		PvnnModbusDriverDevice::Error err = m_device->uploadRegisters(path);
+		if(err != PvnnModbusDriverDevice::NoError){
+			QString second = "";
+			if(err == PvnnModbusDriverDevice::DeviceCompatError){
+				second = tr("Dispositivo non compatibile.");
+			}
+			else if(err == PvnnModbusDriverDevice::DeviceCompatError){
+				second = tr("Impossibile aprire il file.");
+			}
+			QMessageBox::critical(this, "DruidLab", tr("Errore caricamento dati.") + "\n" + second);
+		}
+
+	}
+}
+
+
+
+void DeviceWidget::tableRegisterUpdateDone(){
+	m_tableRegisterUpdateThread = NULL;
+}
+
+void DeviceWidget::tableInputUpdateDone(){
+	m_tableInputUpdateThread = NULL;
+}
+
+void DeviceWidget::tableOutputUpdateDone(){
+	m_tableOutputUpdateThread = NULL;
+}
+
+void DeviceWidget::tablePersonalizedUpdateDone(){
+	m_tablePersonalizedUpdateThread = NULL;
+}
+
+void DeviceWidget::tableDebugUpdateDone(){
+	m_tableDebugUpdateThread = NULL;
+}

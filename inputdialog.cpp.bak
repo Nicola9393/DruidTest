@@ -1,0 +1,169 @@
+/***************************************************************************
+**                                                                        **
+** Copyright (C)  2015 by Piovan S.p.a                                    **
+**                                                                        **
+**	Author: Enricomaria Pavan                                         **
+**                                                                        **
+**                                                                        **
+****************************************************************************/
+
+#include "inputdialog.h"
+#include "ui_inputdialog.h"
+#include "pvnlab.h"
+#include "pvnlab_modbus_driver_item.h"
+#include "math.h"
+#include <limits>
+#include <QShortcut>
+
+InputDialog::InputDialog(QWidget *parent, PvnnModbusDriverItem *item, PvnnModbusDriverItem *minItem, PvnnModbusDriverItem *maxItem): QDialog(parent), m_ui(new Ui::InputDialog){
+	m_ui->setupUi(this);
+
+	connect(m_ui->dsbNumber, SIGNAL(valueChanged(double)), this, SLOT(doubleValueChanged(double)));
+
+	m_item = item;
+	m_minItem = minItem;
+	m_maxItem = maxItem;
+	PVNN_DEBUG<<item->min()<<item->max();
+
+	if(m_item->isMinRelative() and m_minItem != NULL){
+		m_min = m_minItem->value();
+	}
+	else{
+		m_min = item->min();
+	}
+	if(m_item->isMaxRelative() and m_maxItem != NULL){
+		m_max = m_maxItem->value();
+	}
+	else{
+		m_max = item->max();
+	}
+
+	m_ui->lbDescription->setText(item->description());
+
+	if(m_item->type() == PvnnModbusDriverItem::Bit){
+		m_ui->cbInput->setVisible(false);
+		m_ui->frNumber->setVisible(false);
+		m_ui->frText->setVisible(false);
+		m_ui->frBoolean->setVisible(true);
+		m_ui->rbTrue->setChecked(m_item->boolValue());
+		m_ui->rbFalse->setChecked(not m_item->boolValue());
+		m_ui->rbTrue->setFocus();
+	}
+	else if(m_item->type() == PvnnModbusDriverItem::Combo){
+		m_ui->cbInput->setVisible(true);
+		m_ui->frNumber->setVisible(false);
+		m_ui->frText->setVisible(false);
+		m_ui->frBoolean->setVisible(false);
+		m_ui->cbInput->addItems(m_item->choices());
+		m_ui->cbInput->setCurrentIndex(m_item->choices().indexOf(m_item->value()));
+		m_ui->cbInput->setFocus();
+	}
+	else if(m_item->type() == PvnnModbusDriverItem::Int or m_item->type() == PvnnModbusDriverItem::UInt or
+			m_item->type() == PvnnModbusDriverItem::DIntM or m_item->type() == PvnnModbusDriverItem::DIntL or
+			m_item->type() == PvnnModbusDriverItem::Word){
+		m_ui->cbInput->setVisible(false);
+		m_ui->frNumber->setVisible(true);
+		m_ui->frBoolean->setVisible(false);
+		m_ui->frText->setVisible(false);
+
+		if(m_item->type() == PvnnModbusDriverItem::Word or m_item->type() == PvnnModbusDriverItem::UInt){
+			m_ui->dsbNumber->setRange(0, std::numeric_limits<int>::max());
+		}
+		else{
+			m_ui->dsbNumber->setRange(std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+		}
+		if(m_item->factor() < 0){
+			m_ui->dsbNumber->setDecimals(-m_item->factor());
+			m_ui->dsbNumber->setSingleStep(pow(10.0, (double)(m_item->factor())));
+		}
+		else{
+			m_ui->dsbNumber->setDecimals(0);
+			m_ui->dsbNumber->setSingleStep(1);
+		}
+		m_ui->lbUnit->setText(m_item->unit());
+		if(m_item->intMin() != 0 or m_item->intMax() != 0){
+			m_ui->lbDescription->setText(item->description() + "\n[ " + m_item->min() + " ... " + m_item->max() + " ]");
+		}
+		m_ui->dsbNumber->setValue(m_item->value().toDouble());
+		m_ui->dsbNumber->selectAll();
+
+	}
+	else{
+		m_ui->cbInput->setVisible(false);
+		m_ui->frNumber->setVisible(false);
+		m_ui->frBoolean->setVisible(false);
+		m_ui->frText->setVisible(true);
+		m_ui->leInputText->setText(m_item->value());
+		m_ui->leInputText->setSelection(0, m_item->value().length());
+		m_ui->leInputText->setFocus();
+
+	}
+
+	new QShortcut(QKeySequence(Qt::Key_1), m_ui->rbTrue, SLOT(click()));
+	new QShortcut(QKeySequence(Qt::Key_0), m_ui->rbFalse, SLOT(click()));
+
+
+	adjustSize();
+	setWindowTitle("DruidLab");
+}
+
+void InputDialog::accept(){
+	if(m_ui->frBoolean->isVisible()){
+		if(m_ui->rbTrue->isChecked()){
+			m_item->setValue(true);
+			m_tentativeValue = VAL_TRUE;
+		}
+		else{
+			m_item->setValue(false);
+			m_tentativeValue = VAL_FALSE;
+		}
+	}
+	else if(m_ui->frText->isVisible()){
+		m_item->setValue(m_ui->leInputText->text());
+		m_tentativeValue = m_ui->leInputText->text();
+	}
+	else if(m_ui->cbInput->isVisible()){
+		m_item->setValue(m_ui->cbInput->currentText());
+		m_tentativeValue = m_ui->cbInput->currentText();
+	}
+	else if(m_ui->frNumber->isVisible()){
+		m_item->setValue(m_ui->dsbNumber->text());
+		m_tentativeValue = m_ui->dsbNumber->text();
+	}
+	QDialog::accept();
+}
+
+void InputDialog::reject(){
+	QDialog::reject();
+}
+
+InputDialog::~InputDialog(){
+	delete m_ui;
+}
+
+QString InputDialog::tentativeValue(){
+	return m_tentativeValue;
+}
+
+void InputDialog::doubleValueChanged(double value){
+	if(m_item->intMin() != 0 or m_item->intMax() != 0){
+		double min = m_item->min().toDouble();
+		double max = m_item->max().toDouble();
+		if(value < min){
+			QPalette pal(m_ui->dsbNumber->palette());
+			pal.setColor(QPalette::Active, QPalette::Base, PVNN_YELLOW_1);
+			m_ui->dsbNumber->setPalette(pal);
+		}
+		else if(value > max){
+			QPalette pal(m_ui->dsbNumber->palette());
+			pal.setColor(QPalette::Active, QPalette::Base, PVNN_RED_1);
+			m_ui->dsbNumber->setPalette(pal);
+		}
+		else{
+			QPalette pal(m_ui->dsbNumber->palette());
+			pal.setColor(QPalette::Active, QPalette::Base, Qt::white);
+			m_ui->dsbNumber->setPalette(pal);
+		}
+	}
+}
+

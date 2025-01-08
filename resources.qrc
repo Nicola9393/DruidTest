@@ -1,0 +1,40 @@
+<RCC>
+    <qresource prefix="/images">
+        <file>images/ack.png</file>
+        <file>images/bottom.png</file>
+        <file>images/card.png</file>
+        <file>images/connect_creating.png</file>
+        <file>images/connect_no.png</file>
+        <file>images/dfb10.png</file>
+        <file>images/dialog-information.png</file>
+        <file>images/document-new.png</file>
+        <file>images/document-open.png</file>
+        <file>images/document-save.png</file>
+        <file>images/document-save-as.png</file>
+        <file>images/edit-clear.png</file>
+        <file>images/edit-find.png</file>
+        <file>images/edit-find-replace.png</file>
+        <file>images/edit-select-all.png</file>
+        <file>images/emblem-system.png</file>
+        <file>images/filesaveas.png</file>
+        <file>images/folder-open.png</file>
+        <file>images/help-browser.png</file>
+        <file>images/list-add.png</file>
+        <file>images/list-remove.png</file>
+        <file>images/network-connect.png</file>
+        <file>images/news.png</file>
+        <file>images/next.png</file>
+        <file>images/package-x-generic.png</file>
+        <file>images/player_pause.png</file>
+        <file>images/player_play.png</file>
+        <file>images/player_record.png</file>
+        <file>images/player_stop.png</file>
+        <file>images/previous.png</file>
+        <file>images/snooze.png</file>
+        <file>images/start.png</file>
+        <file>images/stop.png</file>
+        <file>images/system-log-out.png</file>
+        <file>images/text-x-generic.png</file>
+        <file>images/druid_lab.png</file>
+    </qresource>
+</RCC>
